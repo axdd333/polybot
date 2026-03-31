@@ -1,0 +1,20 @@
+# Environment variables (sensitive)
+.env
+
+# Rust build artifacts
+target/
+
+# macOS system files
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+
+# Backup files
+*.bak
+*.swp
+*~
+
+# Logs
+*.log
