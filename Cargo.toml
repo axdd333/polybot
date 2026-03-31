@@ -1,0 +1,18 @@
+[package]
+name = "polymarket-btc-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = "1"
+rust_decimal_macros = "1"
+# TUI
+ratatui    = "0.29"
+crossterm  = "0.29"
