@@ -1,7 +1,7 @@
 use crate::analyzer::{self, TradeObservation};
 use crate::config::{ModelWeights, RunMode};
-use crate::events::{MarketDiscovered, NormalizedEvent};
-use crate::executor::{Executor, FillContext, RecentTrade};
+use crate::events::{LiveOrderStatus, MarketDiscovered, NormalizedEvent};
+use crate::executor::{ExecutionReport, ExecutionRequest, Executor, FillContext, RecentTrade};
 use crate::market::types::{MarketId, OrderAction, Side};
 use crate::market::{book, features, model, quote};
 use crate::state::{EngineState, TrackedMarket};
@@ -86,6 +86,21 @@ impl TradingEngine {
             }
             NormalizedEvent::MarketDiscovered { market, .. } => self.register_market(market),
             NormalizedEvent::MarketExpired { market_id, .. } => self.expire_market(market_id),
+            NormalizedEvent::LiveOrderUpdate {
+                market_id,
+                order_id,
+                status,
+                size_matched,
+                ..
+            } => self.apply_live_order_update(market_id, order_id, status, size_matched),
+            NormalizedEvent::LiveTrade {
+                market_id,
+                order_id,
+                action,
+                price,
+                qty,
+                ..
+            } => self.apply_live_trade(market_id, order_id, action, price, qty),
             NormalizedEvent::TimerTick { .. } => {
                 self.state
                     .markets
@@ -95,7 +110,7 @@ impl TradingEngine {
         }
     }
 
-    pub fn refresh_dirty_markets(&mut self) {
+    pub async fn refresh_dirty_markets(&mut self) {
         let dirty: Vec<MarketId> = self.state.markets.dirty.drain().collect();
         for market_id in dirty {
             self.recompute_features(market_id);
@@ -103,7 +118,7 @@ impl TradingEngine {
             self.price_fair_value(market_id);
             self.plan_orders(market_id);
             self.apply_risk(market_id);
-            self.execute(market_id);
+            self.execute(market_id).await;
         }
     }
 
@@ -159,14 +174,16 @@ impl TradingEngine {
             .or_insert_with(|| {
                 TrackedMarket::new(
                     market.instrument_id.clone(),
-                    market.venue_market_key.clone(),
+                    market.condition_id.clone(),
+                    market.token_id.clone(),
                     market.side,
                     Duration::from_secs(market.time_to_expiry_secs),
                 )
             });
 
         tracked.instrument_id = market.instrument_id;
-        tracked.venue_market_key = market.venue_market_key;
+        tracked.condition_id = market.condition_id;
+        tracked.token_id = market.token_id;
         tracked.state.side = market.side;
         tracked.state.time_to_expiry = Duration::from_secs(market.time_to_expiry_secs);
         tracked.state.expiry_anchored_at = Instant::now();
@@ -332,7 +349,7 @@ impl TradingEngine {
         }
     }
 
-    fn execute(&mut self, market_id: MarketId) {
+    async fn execute(&mut self, market_id: MarketId) {
         let Some(tracked) = self.state.markets.markets.get(&market_id) else {
             return;
         };
@@ -363,27 +380,90 @@ impl TradingEngine {
             best_ask,
             recent_trades,
         };
-        let mut filled = Vec::new();
+        let pending = self.state.run.live_orders.get(&market_id);
+        let reports = match self
+            .executor
+            .execute(ExecutionRequest {
+                market_id,
+                token_id: &tracked.token_id,
+                condition_id: &tracked.condition_id,
+                surface: &surface,
+                pending,
+                ctx: &ctx,
+            })
+            .await
+        {
+            Ok(reports) => reports,
+            Err(err) => {
+                self.state
+                    .run
+                    .journal
+                    .push(format!("exec error {} {}: {}", symbol, window, err));
+                return;
+            }
+        };
 
-        for intent in &surface.intents {
-            if let Some(fill_price) = self.executor.try_fill(intent, &ctx) {
-                let filled_qty = self.state.portfolio.apply_fill(
-                    market_id,
-                    intent.action,
-                    fill_price,
-                    intent.qty,
-                    now,
-                );
-                if filled_qty > 0.0 {
-                    filled.push(format!(
-                        "{} {:.1} @ {:.3}",
-                        match intent.action {
+        let mut filled = Vec::new();
+        for report in reports {
+            match report {
+                ExecutionReport::PaperFill { action, price, qty } => {
+                    let filled_qty = self
+                        .state
+                        .portfolio
+                        .apply_fill(market_id, action, price, qty, now);
+                    if filled_qty > 0.0 {
+                        filled.push(format!(
+                            "{} {:.1} @ {:.3}",
+                            match action {
+                                OrderAction::Buy => "BUY",
+                                OrderAction::Sell => "SELL",
+                            },
+                            filled_qty,
+                            price
+                        ));
+                    }
+                }
+                ExecutionReport::LiveOrderAccepted {
+                    order_id,
+                    action,
+                    price,
+                    qty,
+                } => {
+                    self.state.run.live_orders.insert(
+                        market_id,
+                        crate::state::PendingLiveOrder {
+                            order_id: order_id.clone(),
+                            action,
+                            price,
+                            qty,
+                            size_matched: 0.0,
+                        },
+                    );
+                    self.state.run.journal.push(format!(
+                        "live order accepted {} {} {} {} x {:.1} id={}",
+                        symbol,
+                        window,
+                        match action {
                             OrderAction::Buy => "BUY",
                             OrderAction::Sell => "SELL",
                         },
-                        filled_qty,
-                        fill_price
+                        quote::cents_or_dash(price),
+                        qty,
+                        order_id
                     ));
+                }
+                ExecutionReport::LiveOrderCancelled { order_id } => {
+                    self.state.run.live_orders.remove(&market_id);
+                    self.state
+                        .run
+                        .journal
+                        .push(format!("live order cancelled {} {} id={}", symbol, window, order_id));
+                }
+                ExecutionReport::LiveOrderRejected { reason } => {
+                    self.state
+                        .run
+                        .journal
+                        .push(format!("live order rejected {} {}: {}", symbol, window, reason));
                 }
             }
         }
@@ -419,6 +499,52 @@ impl TradingEngine {
         );
         self.state.run.journal.push(summary);
         self.trim_journal();
+    }
+
+    fn apply_live_order_update(
+        &mut self,
+        market_id: MarketId,
+        order_id: String,
+        status: LiveOrderStatus,
+        size_matched: f64,
+    ) {
+        if let Some(pending) = self.state.run.live_orders.get_mut(&market_id) {
+            if pending.order_id == order_id {
+                pending.size_matched = size_matched.max(pending.size_matched);
+                if matches!(
+                    status,
+                    LiveOrderStatus::Cancelled
+                        | LiveOrderStatus::Filled
+                        | LiveOrderStatus::Rejected
+                ) {
+                    self.state.run.live_orders.remove(&market_id);
+                }
+            }
+        }
+    }
+
+    fn apply_live_trade(
+        &mut self,
+        market_id: MarketId,
+        order_id: Option<String>,
+        action: OrderAction,
+        price: f64,
+        qty: f64,
+    ) {
+        let filled_qty = self
+            .state
+            .portfolio
+            .apply_fill(market_id, action, price, qty, Instant::now());
+        if let Some(order_id) = order_id {
+            if let Some(pending) = self.state.run.live_orders.get_mut(&market_id) {
+                if pending.order_id == order_id {
+                    pending.size_matched += filled_qty;
+                    if pending.size_matched + 1e-9 >= pending.qty {
+                        self.state.run.live_orders.remove(&market_id);
+                    }
+                }
+            }
+        }
     }
 
     fn deployed_notional(&self) -> f64 {

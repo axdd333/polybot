@@ -12,13 +12,27 @@ pub enum TimerCadence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketDiscovered {
     pub instrument_id: InstrumentId,
-    pub venue_market_key: String,
+    #[serde(default)]
+    pub condition_id: String,
+    #[serde(default)]
+    pub token_id: String,
     pub title: String,
     pub symbol: String,
     pub window_label: String,
     pub end_label: String,
     pub side: Side,
     pub time_to_expiry_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveOrderStatus {
+    Pending,
+    Open,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +66,21 @@ pub enum NormalizedEvent {
     },
     MarketExpired {
         market_id: MarketId,
+        ts: Instant,
+    },
+    LiveOrderUpdate {
+        market_id: MarketId,
+        order_id: String,
+        status: LiveOrderStatus,
+        size_matched: f64,
+        ts: Instant,
+    },
+    LiveTrade {
+        market_id: MarketId,
+        order_id: Option<String>,
+        action: crate::market::types::OrderAction,
+        price: f64,
+        qty: f64,
         ts: Instant,
     },
     TimerTick {
@@ -92,6 +121,21 @@ pub enum RecordedEvent {
     },
     MarketExpired {
         market_id: MarketId,
+        ts_millis: u64,
+    },
+    LiveOrderUpdate {
+        market_id: MarketId,
+        order_id: String,
+        status: LiveOrderStatus,
+        size_matched: f64,
+        ts_millis: u64,
+    },
+    LiveTrade {
+        market_id: MarketId,
+        order_id: Option<String>,
+        action: crate::market::types::OrderAction,
+        price: f64,
+        qty: f64,
         ts_millis: u64,
     },
     TimerTick {
@@ -150,6 +194,34 @@ impl RecordedEvent {
                 market_id: *market_id,
                 ts_millis,
             },
+            NormalizedEvent::LiveOrderUpdate {
+                market_id,
+                order_id,
+                status,
+                size_matched,
+                ..
+            } => Self::LiveOrderUpdate {
+                market_id: *market_id,
+                order_id: order_id.clone(),
+                status: *status,
+                size_matched: *size_matched,
+                ts_millis,
+            },
+            NormalizedEvent::LiveTrade {
+                market_id,
+                order_id,
+                action,
+                price,
+                qty,
+                ..
+            } => Self::LiveTrade {
+                market_id: *market_id,
+                order_id: order_id.clone(),
+                action: *action,
+                price: *price,
+                qty: *qty,
+                ts_millis,
+            },
             NormalizedEvent::TimerTick { cadence, .. } => Self::TimerTick {
                 cadence: *cadence,
                 ts_millis,
@@ -165,6 +237,8 @@ impl RecordedEvent {
             | Self::TradePrint { ts_millis, .. }
             | Self::MarketDiscovered { ts_millis, .. }
             | Self::MarketExpired { ts_millis, .. }
+            | Self::LiveOrderUpdate { ts_millis, .. }
+            | Self::LiveTrade { ts_millis, .. }
             | Self::TimerTick { ts_millis, .. } => *ts_millis,
         }
     }
@@ -213,6 +287,34 @@ impl RecordedEvent {
             },
             Self::MarketDiscovered { market, .. } => NormalizedEvent::MarketDiscovered { market, ts },
             Self::MarketExpired { market_id, .. } => NormalizedEvent::MarketExpired { market_id, ts },
+            Self::LiveOrderUpdate {
+                market_id,
+                order_id,
+                status,
+                size_matched,
+                ..
+            } => NormalizedEvent::LiveOrderUpdate {
+                market_id,
+                order_id,
+                status,
+                size_matched,
+                ts,
+            },
+            Self::LiveTrade {
+                market_id,
+                order_id,
+                action,
+                price,
+                qty,
+                ..
+            } => NormalizedEvent::LiveTrade {
+                market_id,
+                order_id,
+                action,
+                price,
+                qty,
+                ts,
+            },
             Self::TimerTick { cadence, .. } => NormalizedEvent::TimerTick { cadence, ts },
         }
     }

@@ -1,6 +1,9 @@
 mode = "backtest"
 record_path = "data/backtest.ndjson"
 
+[execution]
+mode = "paper"
+
 [adapter]
 clob_ws_enabled = false
 rtds_enabled = false

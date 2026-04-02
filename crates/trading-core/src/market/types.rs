@@ -183,7 +183,7 @@ pub struct PositionState {
 // Order types (previously in execution.rs)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderAction {
     Buy,
     Sell,

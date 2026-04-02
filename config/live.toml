@@ -1,6 +1,16 @@
 mode = "live"
 record_path = "data/live.ndjson"
 
+[execution]
+mode = "paper"
+
+[execution.live]
+enabled = false
+clob_host = "https://clob.polymarket.com/"
+ws_host = "wss://ws-subscriptions-clob.polymarket.com"
+private_key_env = "POLYMARKET_PRIVATE_KEY"
+signature_type = "eoa"
+
 [adapter]
 clob_ws_enabled = true
 rtds_enabled = true

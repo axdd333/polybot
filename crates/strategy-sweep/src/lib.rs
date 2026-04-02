@@ -4,7 +4,7 @@ mod risk;
 
 use trading_core::config::{AppProfile, RunMode, SweepProfile};
 use trading_core::engine::{EngineParts, TradingEngine};
-use trading_core::executor::PaperExecutor;
+use trading_core::executor::Executor;
 use trading_core::market::book;
 use trading_core::market::quote;
 use trading_core::market::types::{MarketId, MarketState, OrderAction, OrderIntent, OrderSurface};
@@ -14,14 +14,18 @@ pub use planner::{entry_signal_ok, maker_exit_target, market_sort_key};
 pub use projector::SweepProjector;
 pub use risk::SweepRiskPolicy;
 
-pub fn build_engine(profile: &AppProfile, mode: RunMode) -> TradingEngine {
+pub fn build_engine(
+    profile: &AppProfile,
+    mode: RunMode,
+    executor: Box<dyn Executor>,
+) -> TradingEngine {
     TradingEngine::new(EngineParts {
         mode,
         starting_cash: profile.sweep.starting_cash,
         model_weights: profile.model_weights.clone(),
         strategy: Box::new(SweepStrategy::new(profile.sweep.clone())),
         risk_policy: Box::new(SweepRiskPolicy::new(profile.risk.clone())),
-        executor: Box::new(PaperExecutor),
+        executor,
         projector: Box::new(SweepProjector),
     })
 }

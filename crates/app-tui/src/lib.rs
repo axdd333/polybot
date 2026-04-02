@@ -6,7 +6,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use polymarket_adapter::spawn_live_feeds;
+use polymarket_adapter::{build_executor, spawn_live_feeds};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::sync::Arc;
@@ -29,7 +29,8 @@ pub async fn run(profile: AppProfile) -> Result<()> {
         None => None,
     };
 
-    let mut engine = build_engine(&profile, RunMode::Live);
+    let executor = build_executor(&profile)?;
+    let mut engine = build_engine(&profile, RunMode::Live, executor);
     *snapshot_cache.write().await = engine.snapshot();
 
     let processor = tokio::spawn(async move {
@@ -38,7 +39,7 @@ pub async fn run(profile: AppProfile) -> Result<()> {
                 recorder.record(&event)?;
             }
             engine.apply_event(event);
-            engine.refresh_dirty_markets();
+            engine.refresh_dirty_markets().await;
             *snapshot_writer.write().await = engine.snapshot();
         }
         if let Some(recorder) = recorder.as_mut() {
@@ -48,7 +49,11 @@ pub async fn run(profile: AppProfile) -> Result<()> {
     });
 
     let mut terminal = TerminalSession::enter()?;
-    let live_handles = spawn_live_feeds(profile.adapter.clone(), tx.clone());
+    let live_handles = spawn_live_feeds(
+        profile.adapter.clone(),
+        Some(profile.execution.live.clone()),
+        tx.clone(),
+    );
     let timer_handle = tokio::spawn(live_timers(tx.clone()));
     let mut quit_rx = spawn_quit_listener();
     let render_result = render_loop(&mut terminal, snapshot_cache, &mut quit_rx).await;
@@ -127,7 +132,7 @@ fn spawn_quit_listener() -> mpsc::Receiver<()> {
 
 fn ensure_tty() -> Result<()> {
     if !crossterm::tty::IsTty::is_tty(&io::stdin()) {
-        eprintln!("Run this directly in a terminal: cargo run -p app-cli -- live");
+        eprintln!("Run this directly in a terminal: cargo run");
         std::process::exit(1);
     }
 

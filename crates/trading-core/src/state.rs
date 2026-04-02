@@ -1,7 +1,7 @@
 use crate::analyzer::{MarketRuntime, UnderlyingPoint};
 use crate::config::RunMode;
 use crate::market::features::FeatureVector;
-use crate::market::types::{InstrumentId, MarketId, MarketState, OrderSurface, Side};
+use crate::market::types::{InstrumentId, MarketId, MarketState, OrderAction, OrderSurface, Side};
 use crate::portfolio::Portfolio;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -9,7 +9,8 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct TrackedMarket {
     pub instrument_id: InstrumentId,
-    pub venue_market_key: String,
+    pub condition_id: String,
+    pub token_id: String,
     pub state: MarketState,
     pub runtime: MarketRuntime,
     pub features: Option<FeatureVector>,
@@ -19,13 +20,15 @@ pub struct TrackedMarket {
 impl TrackedMarket {
     pub fn new(
         instrument_id: InstrumentId,
-        venue_market_key: String,
+        condition_id: String,
+        token_id: String,
         side: Side,
         time_to_expiry: Duration,
     ) -> Self {
         Self {
             instrument_id: instrument_id.clone(),
-            venue_market_key,
+            condition_id,
+            token_id,
             state: MarketState::new(instrument_id.market, side, time_to_expiry),
             runtime: MarketRuntime::default(),
             features: None,
@@ -36,7 +39,8 @@ impl TrackedMarket {
     pub fn placeholder(market_id: MarketId) -> Self {
         Self::new(
             InstrumentId::placeholder(market_id),
-            format!("placeholder:{}", market_id.0),
+            format!("condition:placeholder:{}", market_id.0),
+            format!("token:placeholder:{}", market_id.0),
             Side::Up,
             Duration::from_secs(300),
         )
@@ -58,6 +62,7 @@ pub struct UnderlyingStore {
 pub struct RunState {
     pub mode: RunMode,
     pub journal: Vec<String>,
+    pub live_orders: HashMap<MarketId, PendingLiveOrder>,
 }
 
 impl RunState {
@@ -65,8 +70,18 @@ impl RunState {
         Self {
             mode,
             journal: Vec::new(),
+            live_orders: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingLiveOrder {
+    pub order_id: String,
+    pub action: OrderAction,
+    pub price: f64,
+    pub qty: f64,
+    pub size_matched: f64,
 }
 
 #[derive(Debug)]

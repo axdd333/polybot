@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use polymarket_adapter::spawn_live_feeds;
+use polymarket_adapter::{build_executor, spawn_live_feeds};
 use std::path::PathBuf;
 use std::time::Duration;
 use strategy_sweep::build_engine;
@@ -54,8 +54,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Live { profile } => app_tui::run(load_profile(profile)?).await,
-        Command::Replay { events, profile } => run_offline(load_profile(profile)?, events, RunMode::Replay),
-        Command::Backtest { events, profile } => run_offline(load_profile(profile)?, events, RunMode::Backtest),
+        Command::Replay { events, profile } => run_offline(load_profile(profile)?, events, RunMode::Replay).await,
+        Command::Backtest { events, profile } => run_offline(load_profile(profile)?, events, RunMode::Backtest).await,
         Command::Record {
             output,
             duration_secs,
@@ -69,11 +69,12 @@ async fn main() -> Result<()> {
     }
 }
 
-fn run_offline(profile: AppProfile, events_path: PathBuf, mode: RunMode) -> Result<()> {
-    let mut engine = build_engine(&profile, mode);
+async fn run_offline(profile: AppProfile, events_path: PathBuf, mode: RunMode) -> Result<()> {
+    let executor = build_executor(&profile)?;
+    let mut engine = build_engine(&profile, mode, executor);
     for event in read_recorded_events(events_path)? {
         engine.apply_event(event);
-        engine.refresh_dirty_markets();
+        engine.refresh_dirty_markets().await;
     }
 
     let snapshot = engine.snapshot();
@@ -115,7 +116,11 @@ fn run_offline(profile: AppProfile, events_path: PathBuf, mode: RunMode) -> Resu
 async fn run_record(profile: AppProfile, output: PathBuf, duration_secs: u64) -> Result<()> {
     let mut recorder = EventRecorder::create(&output)?;
     let (tx, mut rx) = mpsc::channel::<NormalizedEvent>(1024);
-    let handles = spawn_live_feeds(profile.adapter, tx);
+    let handles = spawn_live_feeds(
+        profile.adapter,
+        Some(profile.execution.live.clone()),
+        tx,
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
 
     loop {
@@ -148,6 +153,7 @@ mod tests {
             .join("../../");
         let profile = load_profile(root.join("config/backtest.toml")).unwrap();
         let events = root.join("data/fixtures/sample_positive.ndjson");
-        assert!(run_offline(profile, events, RunMode::Backtest).is_ok());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(run_offline(profile, events, RunMode::Backtest)).is_ok());
     }
 }

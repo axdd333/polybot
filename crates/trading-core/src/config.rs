@@ -11,6 +11,33 @@ pub enum RunMode {
     Backtest,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Paper,
+    Live,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::Paper
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WalletSignatureType {
+    Eoa,
+    Proxy,
+    GnosisSafe,
+}
+
+impl Default for WalletSignatureType {
+    fn default() -> Self {
+        Self::Eoa
+    }
+}
+
 impl Default for RunMode {
     fn default() -> Self {
         Self::Live
@@ -49,6 +76,51 @@ impl Default for AdapterProfile {
             chainlink_fallback_enabled: true,
             universe_refresh_secs: 20,
             polygon_rpc_url: "https://polygon.drpc.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveProfile {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub clob_host: String,
+    #[serde(default)]
+    pub ws_host: String,
+    #[serde(default)]
+    pub private_key_env: String,
+    #[serde(default)]
+    pub signature_type: WalletSignatureType,
+    pub funder: Option<String>,
+}
+
+impl Default for LiveProfile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            clob_host: "https://clob.polymarket.com/".to_string(),
+            ws_host: "wss://ws-subscriptions-clob.polymarket.com".to_string(),
+            private_key_env: "POLYMARKET_PRIVATE_KEY".to_string(),
+            signature_type: WalletSignatureType::Eoa,
+            funder: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionProfile {
+    #[serde(default)]
+    pub mode: ExecutionMode,
+    #[serde(default)]
+    pub live: LiveProfile,
+}
+
+impl Default for ExecutionProfile {
+    fn default() -> Self {
+        Self {
+            mode: ExecutionMode::Paper,
+            live: LiveProfile::default(),
         }
     }
 }
@@ -134,6 +206,8 @@ pub struct AppProfile {
     pub mode: RunMode,
     pub record_path: Option<String>,
     #[serde(default)]
+    pub execution: ExecutionProfile,
+    #[serde(default)]
     pub adapter: AdapterProfile,
     #[serde(default)]
     pub sweep: SweepProfile,
@@ -148,6 +222,7 @@ impl Default for AppProfile {
         Self {
             mode: RunMode::Live,
             record_path: None,
+            execution: ExecutionProfile::default(),
             adapter: AdapterProfile::default(),
             sweep: SweepProfile::default(),
             risk: RiskProfile::default(),

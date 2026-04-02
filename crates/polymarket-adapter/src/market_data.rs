@@ -1,15 +1,19 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use futures::{future, StreamExt};
+use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
-use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, LastTradePrice};
+use polymarket_client_sdk::clob::types::Side as ClobSide;
+use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, LastTradePrice, OrderMessageType};
 use polymarket_client_sdk::clob::ws::Client as ClobWsClient;
+use polymarket_client_sdk::clob::Client as ClobClient;
 use polymarket_client_sdk::gamma::types::request::EventsRequest;
 use polymarket_client_sdk::gamma::types::response::Event as GammaEvent;
 use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::rtds::Client as RtdsClient;
-use polymarket_client_sdk::types::{Decimal, U256};
+use polymarket_client_sdk::types::{Address, B256, Decimal, U256};
+use polymarket_client_sdk::POLYGON;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -19,16 +23,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use trading_core::config::{AdapterProfile, AssetConfig};
-use trading_core::events::{MarketDiscovered, NormalizedEvent};
+use trading_core::config::{AdapterProfile, AssetConfig, LiveProfile, WalletSignatureType};
+use trading_core::events::{LiveOrderStatus, MarketDiscovered, NormalizedEvent};
 use trading_core::market::quote;
-use trading_core::market::types::{AssetSymbol, InstrumentId, L2Level, MarketId, Side, Venue};
+use trading_core::market::types::{AssetSymbol, InstrumentId, L2Level, MarketId, OrderAction, Side, Venue};
 
 const ERROR_NOTE_MAX_CHARS: usize = 96;
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 30;
 
 #[derive(Clone, Debug)]
 struct LiveMarket {
+    condition_id: String,
     title: String,
     symbol: String,
     window_label: String,
@@ -47,15 +52,18 @@ struct Registry {
 
 pub fn spawn_live_feeds(
     config: AdapterProfile,
+    live: Option<LiveProfile>,
     tx: mpsc::Sender<NormalizedEvent>,
 ) -> Vec<JoinHandle<()>> {
     let registry = Arc::new(RwLock::new(Registry::default()));
     let (asset_tx, asset_rx) = watch::channel(Vec::<U256>::new());
+    let (condition_tx, condition_rx) = watch::channel(Vec::<String>::new());
     let mut handles = vec![tokio::spawn(universe_refresh(
         config.clone(),
         tx.clone(),
         registry.clone(),
         asset_tx,
+        condition_tx,
     ))];
 
     if config.clob_ws_enabled {
@@ -71,7 +79,16 @@ pub fn spawn_live_feeds(
     }
 
     if config.chainlink_fallback_enabled {
-        handles.push(tokio::spawn(chainlink_fallback_loop(config, tx)));
+        handles.push(tokio::spawn(chainlink_fallback_loop(config.clone(), tx.clone())));
+    }
+
+    if let Some(live) = live.filter(|live| live.enabled) {
+        handles.push(tokio::spawn(user_ws_loop(
+            live,
+            tx,
+            registry,
+            condition_rx,
+        )));
     }
 
     handles
@@ -82,6 +99,7 @@ async fn universe_refresh(
     tx: mpsc::Sender<NormalizedEvent>,
     registry: Arc<RwLock<Registry>>,
     asset_tx: watch::Sender<Vec<U256>>,
+    condition_tx: watch::Sender<Vec<String>>,
 ) {
     let gamma = GammaClient::default();
     let clob = polymarket_client_sdk::clob::Client::default();
@@ -91,6 +109,7 @@ async fn universe_refresh(
         match fetch_active_markets(&gamma, &config).await {
             Ok(markets) => {
                 let mut ids = Vec::new();
+                let mut condition_ids = Vec::new();
                 let mut fresh_active = HashSet::new();
                 {
                     let mut reg = registry.write().await;
@@ -100,6 +119,7 @@ async fn universe_refresh(
                         fresh_active.insert(market.down_market_id);
                         reg.tokens.insert(market.up_token_id, market.up_market_id);
                         reg.tokens.insert(market.down_token_id, market.down_market_id);
+                        condition_ids.push(market.condition_id.clone());
                         ids.push(market.up_token_id);
                         ids.push(market.down_token_id);
                     }
@@ -133,6 +153,7 @@ async fn universe_refresh(
                 active_market_ids = fresh_active;
 
                 let _ = asset_tx.send(ids.clone());
+                let _ = condition_tx.send(condition_ids);
                 backfill_books(&clob, &tx, &registry, &ids).await;
             }
             Err(err) => {
@@ -141,6 +162,107 @@ async fn universe_refresh(
         }
 
         tokio::time::sleep(Duration::from_secs(config.universe_refresh_secs)).await;
+    }
+}
+
+async fn user_ws_loop(
+    live: LiveProfile,
+    tx: mpsc::Sender<NormalizedEvent>,
+    registry: Arc<RwLock<Registry>>,
+    mut condition_rx: watch::Receiver<Vec<String>>,
+) {
+    let (client, ws_client) = match authenticated_clients(&live).await {
+        Ok(clients) => clients,
+        Err(err) => {
+            let _ = tx
+                .send(NormalizedEvent::TimerTick {
+                    cadence: trading_core::events::TimerCadence::Slow,
+                    ts: Instant::now(),
+                })
+                .await;
+            eprintln!("live auth failed: {err}");
+            return;
+        }
+    };
+
+    let _ = client;
+    let mut failures = 0_u32;
+    loop {
+        let condition_ids = condition_rx.borrow().clone();
+        if condition_ids.is_empty() {
+            if condition_rx.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        let markets: Vec<B256> = condition_ids
+            .iter()
+            .filter_map(|id| id.parse::<B256>().ok())
+            .collect();
+        if markets.is_empty() {
+            if condition_rx.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        let orders = match ws_client.subscribe_orders(markets.clone()) {
+            Ok(stream) => Box::pin(stream.fuse()),
+            Err(_) => {
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(reconnect_delay(failures)).await;
+                continue;
+            }
+        };
+        let trades = match ws_client.subscribe_trades(markets) {
+            Ok(stream) => Box::pin(stream.fuse()),
+            Err(_) => {
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(reconnect_delay(failures)).await;
+                continue;
+            }
+        };
+
+        failures = 0;
+        let mut orders = orders;
+        let mut trades = trades;
+        let mut ended_cleanly = false;
+
+        loop {
+            tokio::select! {
+                changed = condition_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if *condition_rx.borrow() != condition_ids {
+                        ended_cleanly = true;
+                        break;
+                    }
+                }
+                item = orders.next() => {
+                    match item {
+                        Some(Ok(order)) => {
+                            translate_user_order(order, &tx, &registry).await;
+                        }
+                        Some(Err(_)) | None => break,
+                    }
+                }
+                item = trades.next() => {
+                    match item {
+                        Some(Ok(trade)) => {
+                            translate_user_trade(trade, &tx, &registry).await;
+                        }
+                        Some(Err(_)) | None => break,
+                    }
+                }
+            }
+        }
+
+        if !ended_cleanly {
+            failures = failures.saturating_add(1);
+            tokio::time::sleep(reconnect_delay(failures)).await;
+        }
     }
 }
 
@@ -276,6 +398,10 @@ fn discovery_from_live_market(market: &LiveMarket, side: Side) -> MarketDiscover
         Side::Up => market.up_market_id,
         Side::Down => market.down_market_id,
     };
+    let token_id = match side {
+        Side::Up => market.up_token_id.to_string(),
+        Side::Down => market.down_token_id.to_string(),
+    };
     MarketDiscovered {
         instrument_id: InstrumentId {
             venue: Venue::Polymarket,
@@ -283,7 +409,8 @@ fn discovery_from_live_market(market: &LiveMarket, side: Side) -> MarketDiscover
             market: market_id,
             side,
         },
-        venue_market_key: format!("{}:{}", market.title, market.window_label),
+        condition_id: market.condition_id.clone(),
+        token_id,
         title: market.title.clone(),
         symbol: market.symbol.clone(),
         window_label: market.window_label.clone(),
@@ -291,6 +418,67 @@ fn discovery_from_live_market(market: &LiveMarket, side: Side) -> MarketDiscover
         side,
         time_to_expiry_secs: market.time_to_expiry.as_secs(),
     }
+}
+
+async fn translate_user_order(
+    order: polymarket_client_sdk::clob::ws::types::response::OrderMessage,
+    tx: &mpsc::Sender<NormalizedEvent>,
+    registry: &Arc<RwLock<Registry>>,
+) {
+    let market_id = {
+        let reg = registry.read().await;
+        reg.tokens.get(&order.asset_id).copied()
+    };
+    let Some(market_id) = market_id else {
+        return;
+    };
+    let _ = tx
+        .send(NormalizedEvent::LiveOrderUpdate {
+            market_id,
+            order_id: order.id,
+            status: map_live_order_status(order.msg_type.as_ref()),
+            size_matched: order
+                .size_matched
+                .map(quote::decimal_to_f64)
+                .unwrap_or(0.0),
+            ts: Instant::now(),
+        })
+        .await;
+}
+
+async fn translate_user_trade(
+    trade: polymarket_client_sdk::clob::ws::types::response::TradeMessage,
+    tx: &mpsc::Sender<NormalizedEvent>,
+    registry: &Arc<RwLock<Registry>>,
+) {
+    let market_id = {
+        let reg = registry.read().await;
+        reg.tokens.get(&trade.asset_id).copied()
+    };
+    let Some(market_id) = market_id else {
+        return;
+    };
+    let order_id = trade
+        .taker_order_id
+        .clone()
+        .or_else(|| trade.maker_orders.first().map(|maker| maker.order_id.clone()));
+    let action = match trade.side {
+        ClobSide::Buy => OrderAction::Buy,
+        ClobSide::Sell => OrderAction::Sell,
+        ClobSide::Unknown => return,
+        _ => return,
+    };
+
+    let _ = tx
+        .send(NormalizedEvent::LiveTrade {
+            market_id,
+            order_id,
+            action,
+            price: quote::decimal_to_f64(trade.price),
+            qty: quote::decimal_to_f64(trade.size),
+            ts: Instant::now(),
+        })
+        .await;
 }
 
 async fn translate_book(
@@ -430,6 +618,9 @@ fn normalize_events(
         let Some(market) = event.markets.as_ref().and_then(|markets| markets.first()) else {
             continue;
         };
+        let Some(condition_id) = market.condition_id.map(|value| value.to_string()) else {
+            continue;
+        };
         let Some(end_time) = market.end_date else {
             continue;
         };
@@ -469,6 +660,7 @@ fn normalize_events(
             .unwrap_or_else(|| "Unknown Event".to_string());
 
         markets.push(LiveMarket {
+            condition_id,
             title,
             symbol: asset.name.clone(),
             window_label: format!("{start_label}-{end_label}"),
@@ -484,6 +676,40 @@ fn normalize_events(
     markets.sort_by_key(|market| market.time_to_expiry);
     markets.truncate(48);
     markets
+}
+
+async fn authenticated_clients(
+    live: &LiveProfile,
+) -> Result<(
+    ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    ClobWsClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+)> {
+    let private_key = std::env::var(&live.private_key_env)
+        .with_context(|| format!("missing env var {}", live.private_key_env))?;
+    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
+    let mut auth = ClobClient::new(&live.clob_host, Default::default())?
+        .authentication_builder(&signer);
+    match live.signature_type {
+        WalletSignatureType::Eoa => auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::Eoa),
+        WalletSignatureType::Proxy => auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy),
+        WalletSignatureType::GnosisSafe => auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::GnosisSafe),
+    }
+    if let Some(funder) = &live.funder {
+        auth = auth.funder(funder.parse::<Address>()?);
+    }
+    let client = auth.authenticate().await?;
+    let ws = ClobWsClient::new(&live.ws_host, Default::default())?
+        .authenticate(client.credentials().clone(), client.address())?;
+    Ok((client, ws))
+}
+
+fn map_live_order_status(msg_type: Option<&OrderMessageType>) -> LiveOrderStatus {
+    match msg_type {
+        Some(OrderMessageType::Placement) => LiveOrderStatus::Open,
+        Some(OrderMessageType::Update) => LiveOrderStatus::PartiallyFilled,
+        Some(OrderMessageType::Cancellation) => LiveOrderStatus::Cancelled,
+        _ => LiveOrderStatus::Pending,
+    }
 }
 
 fn hashed_market_id(slug: &str, side: &str) -> MarketId {
