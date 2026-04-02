@@ -1,0 +1,11 @@
+[package]
+name = "strategy-sweep"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trading-core = { path = "../trading-core" }
+
+[dev-dependencies]
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true

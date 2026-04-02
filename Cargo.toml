@@ -1,18 +1,29 @@
-[package]
-name = "polymarket-btc-bot"
+[workspace]
+members = [
+    "crates/trading-core",
+    "crates/polymarket-adapter",
+    "crates/strategy-sweep",
+    "crates/app-tui",
+    "crates/app-cli",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob"] }
-tokio = { version = "1", features = ["full"] }
+[workspace.dependencies]
 anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+futures = "0.3"
+polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob", "ws", "rtds"] }
+ratatui = "0.29"
 reqwest = { version = "0.12", features = ["json"] }
+rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal_macros = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = "1"
-rust_decimal_macros = "1"
-# TUI
-ratatui    = "0.29"
-crossterm  = "0.29"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"

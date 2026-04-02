@@ -1,0 +1,6 @@
+{"kind":"market_discovered","market":{"instrument_id":{"venue":"Polymarket","symbol":"BTC","market":42,"side":"Up"},"venue_market_key":"fixture-btc-1","title":"Fixture BTC Window","symbol":"BTC","window_label":"12:00-12:05","end_label":"12:05","side":"Up","time_to_expiry_secs":300},"ts_millis":0}
+{"kind":"underlying_tick","symbol":"BTC","px":100000.0,"ts_millis":0}
+{"kind":"underlying_tick","symbol":"BTC","px":101000.0,"ts_millis":1500}
+{"kind":"book_snapshot","market_id":42,"bids":[{"price":"0.96","size":"100"}],"asks":[{"price":"0.97","size":"1"}],"ts_millis":1500}
+{"kind":"trade_print","market_id":42,"price":0.97,"size":100.0,"ts_millis":1500}
+{"kind":"book_snapshot","market_id":42,"bids":[{"price":"0.98","size":"100"}],"asks":[{"price":"0.99","size":"1"}],"ts_millis":3000}

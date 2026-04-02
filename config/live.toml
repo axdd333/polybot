@@ -1,0 +1,42 @@
+mode = "live"
+record_path = "data/live.ndjson"
+
+[adapter]
+clob_ws_enabled = true
+rtds_enabled = true
+chainlink_fallback_enabled = true
+universe_refresh_secs = 20
+polygon_rpc_url = "https://polygon.drpc.org"
+
+[[adapter.assets]]
+name = "BTC"
+oracle = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+rtds_symbol = "btcusdt"
+slug_prefixes = ["bitcoin", "btc"]
+
+[sweep]
+starting_cash = 100.0
+ticket_dollars = 2.0
+max_entry_price = 0.99
+take_profit_price = 0.98
+min_edge_to_buy = 0.01
+max_spread = 0.03
+max_pair_ask_sum = 1.02
+paper_real_mode = true
+
+[risk]
+inv_limit = 100.0
+base_qty = 10.0
+max_loss = 0.03
+
+[model_weights]
+ret_z_1s = 0.28
+accel = 0.16
+microprice_gap = 0.18
+imbalance_5lvl = 0.14
+trade_intensity = 0.10
+cross_window_torsion = 0.12
+wall_persistence_score = 0.10
+vol_short = -0.14
+spread_ticks = -0.12
+liquidity_void_score = -0.10

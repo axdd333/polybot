@@ -1,0 +1,14 @@
+[package]
+name = "app-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+app-tui = { path = "../app-tui" }
+clap.workspace = true
+polymarket-adapter = { path = "../polymarket-adapter" }
+serde_json.workspace = true
+strategy-sweep = { path = "../strategy-sweep" }
+tokio.workspace = true
+trading-core = { path = "../trading-core" }

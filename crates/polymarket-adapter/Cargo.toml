@@ -1,0 +1,15 @@
+[package]
+name = "polymarket-adapter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+polymarket-client-sdk.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+trading-core = { path = "../trading-core" }
