@@ -4,12 +4,19 @@ record_path = "data/backtest.ndjson"
 [execution]
 mode = "paper"
 
+[execution.paper]
+latency_ms = 90
+stale_after_ms = 1500
+rest_queue_mult = 1.05
+
 [adapter]
 clob_ws_enabled = false
 rtds_enabled = false
 chainlink_fallback_enabled = false
 universe_refresh_secs = 20
 polygon_rpc_url = "https://polygon.drpc.org"
+allowed_window_mins = [5, 15]
+max_markets = 96
 
 [[adapter.assets]]
 name = "BTC"
@@ -20,17 +27,85 @@ slug_prefixes = ["bitcoin", "btc"]
 [sweep]
 starting_cash = 100.0
 ticket_dollars = 2.0
+min_entry_price = 0.05
 max_entry_price = 0.99
+max_tick_frac = 0.03
 take_profit_price = 0.98
+min_exit_roi = 0.03
+hold_green_secs = 15
 min_edge_to_buy = 0.01
 max_spread = 0.03
 max_pair_ask_sum = 1.02
+max_open_positions = 3
 paper_real_mode = true
+min_model_score = 0.08
+min_fair_gap_after_cost = 0.004
+min_net_edge_buy = 0.003
+min_net_edge_sell = -0.002
+entry_slippage_bps = 8.0
+exit_slippage_bps = 10.0
+no_new_entry_expiry_secs = 45
+reduce_size_expiry_secs = 120
+max_hold_secs = 90
+max_stale_fair_secs = 20
+min_fair_improve = 0.003
+scratch_edge = -0.004
+trailing_drawdown_frac = 0.45
+max_void_score = 0.68
+min_wall_score = 0.18
+max_cancel_skew = 0.9
+min_queue_fill_score = 0.28
+min_queue_trade_intensity = 2.0
+
+[sweep.reversal]
+enabled = true
+capture_secs = 75
+start_secs = 75
+end_secs = 150
+min_drawdown_bps = 6.0
+min_rebound_bps = 2.0
+min_rebound_frac = 0.35
+min_wick_bias = 0.08
+min_signal_score = 0.55
+ttl_ms = 800
+
+[sweep.regime.continuation]
+edge_mult = 0.85
+spread_mult = 1.15
+ticket_mult = 1.2
+exit_only = false
+
+[sweep.regime.reversion]
+edge_mult = 1.0
+spread_mult = 1.0
+ticket_mult = 1.0
+exit_only = false
+
+[sweep.regime.chop]
+edge_mult = 1.35
+spread_mult = 0.7
+ticket_mult = 0.6
+exit_only = false
+
+[sweep.regime.burst]
+edge_mult = 0.75
+spread_mult = 1.2
+ticket_mult = 1.35
+exit_only = false
+
+[sweep.regime.expiry_pinch]
+edge_mult = 2.0
+spread_mult = 0.5
+ticket_mult = 0.0
+exit_only = true
 
 [risk]
 inv_limit = 100.0
 base_qty = 10.0
 max_loss = 0.03
+asset_notional_limit = 25.0
+regime_notional_limit = 40.0
+corr_bucket_notional_limit = 25.0
 
 [model_weights]
 ret_z_1s = 0.28

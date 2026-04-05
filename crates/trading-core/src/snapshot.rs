@@ -1,3 +1,4 @@
+use crate::config::RunMode;
 use crate::market::features::FeatureVector;
 use crate::market::types::{MarketId, OrderIntent, Regime, Side};
 
@@ -35,10 +36,14 @@ pub struct MarketSnapshot {
     pub edge_series: Vec<(f64, f64)>,
     pub flow_series: Vec<(f64, f64)>,
     pub micro_series: Vec<(f64, f64)>,
+    pub maker_fee_bps: f64,
+    pub taker_fee_bps: f64,
+    pub min_tick_size: f64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WorldSnapshot {
+    pub mode: RunMode,
     pub markets: Vec<MarketSnapshot>,
     pub journal_tail: Vec<String>,
     pub cash: f64,
@@ -48,14 +53,58 @@ pub struct WorldSnapshot {
     pub open_positions: usize,
     pub kill_switch: bool,
     pub stream_splits: u32,
-    pub btc_spot: f64,
+    pub ref_symbol: String,
+    pub ref_spot: f64,
     pub signal_strength: f64,
     pub realized_pnl_5m: f64,
     pub pnl_shortfall_5m: f64,
+    pub flow_pnl_per_min: f64,
+    pub cycle_rate_per_min: f64,
+    pub avg_hold_secs: f64,
+    pub recent_closed_pnl: f64,
     pub eligible_markets: usize,
     pub ticket_dollars: f64,
+    pub min_entry_threshold: f64,
     pub entry_threshold: f64,
+    pub no_new_entry_expiry_secs: u64,
     pub exit_threshold: f64,
+    pub min_exit_roi: f64,
+    pub max_tick_frac: f64,
     pub max_spread: f64,
     pub paper_real_mode: bool,
+    pub backtest: Option<BacktestSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BacktestPhase {
+    #[default]
+    Idle,
+    Running,
+    Paused,
+    Completed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BacktestSnapshot {
+    pub phase: BacktestPhase,
+    pub processed_events: usize,
+    pub total_events: usize,
+    pub progress: f64,
+    pub batch_size: usize,
+    pub wall_secs: f64,
+    pub sim_secs: f64,
+    pub total_sim_secs: f64,
+    pub event_rate: f64,
+    pub closed_trades: usize,
+    pub wins: usize,
+    pub losses: usize,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub best_trade: f64,
+    pub worst_trade: f64,
+    pub max_drawdown_frac: f64,
+    pub peak_equity: f64,
+    pub total_return: f64,
+    pub equity_series: Vec<(f64, f64)>,
+    pub drawdown_series: Vec<(f64, f64)>,
 }

@@ -4,7 +4,7 @@ use crate::market::features::FeatureVector;
 use crate::market::types::{InstrumentId, MarketId, MarketState, OrderAction, OrderSurface, Side};
 use crate::portfolio::Portfolio;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct TrackedMarket {
@@ -90,6 +90,7 @@ pub struct EngineState {
     pub underlyings: UnderlyingStore,
     pub portfolio: Portfolio,
     pub run: RunState,
+    pub now: Instant,
 }
 
 impl EngineState {
@@ -99,6 +100,7 @@ impl EngineState {
             underlyings: UnderlyingStore::default(),
             portfolio: Portfolio::with_starting_cash(starting_cash),
             run: RunState::new(mode),
+            now: Instant::now(),
         }
     }
 }

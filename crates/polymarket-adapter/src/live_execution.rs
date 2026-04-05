@@ -13,7 +13,9 @@ use trading_core::market::types::OrderAction;
 
 pub fn build_executor(profile: &AppProfile) -> Result<Box<dyn Executor>> {
     if !matches!(profile.execution.mode, ExecutionMode::Live) {
-        return Ok(Box::new(PaperExecutor));
+        return Ok(Box::new(PaperExecutor::new(
+            profile.execution.paper.clone(),
+        )));
     }
 
     if !profile.execution.live.enabled {
@@ -24,7 +26,11 @@ pub fn build_executor(profile: &AppProfile) -> Result<Box<dyn Executor>> {
 }
 
 struct LiveOrderExecutor {
-    client: Mutex<ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
+    client: Mutex<
+        ClobClient<
+            polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+        >,
+    >,
     private_key: String,
 }
 
@@ -33,8 +39,8 @@ impl LiveOrderExecutor {
         let private_key = std::env::var(&config.private_key_env)
             .with_context(|| format!("missing env var {}", config.private_key_env))?;
         let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
-        let mut auth = ClobClient::new(&config.clob_host, Default::default())?
-            .authentication_builder(&signer);
+        let mut auth =
+            ClobClient::new(&config.clob_host, Default::default())?.authentication_builder(&signer);
 
         match config.signature_type {
             WalletSignatureType::Eoa => {
@@ -159,7 +165,10 @@ impl Executor for LiveOrderExecutor {
             (Some(pending), Some(intent)) if self.same_order(pending, intent) => {}
             (Some(pending), Some(intent)) => {
                 reports.push(self.cancel_order(&pending.order_id).await?);
-                if matches!(reports.last(), Some(ExecutionReport::LiveOrderCancelled { .. })) {
+                if matches!(
+                    reports.last(),
+                    Some(ExecutionReport::LiveOrderCancelled { .. })
+                ) {
                     reports.push(self.submit_limit_order(request.token_id, intent).await?);
                 }
             }

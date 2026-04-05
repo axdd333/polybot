@@ -4,6 +4,11 @@ record_path = "data/live.ndjson"
 [execution]
 mode = "paper"
 
+[execution.paper]
+latency_ms = 90
+stale_after_ms = 1500
+rest_queue_mult = 1.05
+
 [execution.live]
 enabled = false
 clob_host = "https://clob.polymarket.com/"
@@ -15,8 +20,10 @@ signature_type = "eoa"
 clob_ws_enabled = true
 rtds_enabled = true
 chainlink_fallback_enabled = true
-universe_refresh_secs = 20
+universe_refresh_secs = 8
 polygon_rpc_url = "https://polygon.drpc.org"
+allowed_window_mins = [5, 15]
+max_markets = 96
 
 [[adapter.assets]]
 name = "BTC"
@@ -25,19 +32,102 @@ rtds_symbol = "btcusdt"
 slug_prefixes = ["bitcoin", "btc"]
 
 [sweep]
-starting_cash = 100.0
-ticket_dollars = 2.0
-max_entry_price = 0.99
-take_profit_price = 0.98
-min_edge_to_buy = 0.01
-max_spread = 0.03
-max_pair_ask_sum = 1.02
+starting_cash = 250.0
+ticket_dollars = 20.0
+min_entry_price = 0.01
+max_entry_price = 0.95
+max_tick_frac = 1.00
+take_profit_price = 0.96
+min_exit_roi = 0.01
+hold_green_secs = 15
+min_edge_to_buy = 0.006
+max_spread = 0.99
+max_pair_ask_sum = 1.00
+max_open_positions = 1
 paper_real_mode = true
+min_model_score = 0.10
+min_fair_gap_after_cost = 0.006
+min_net_edge_buy = 0.004
+min_net_edge_sell = 0.0
+entry_slippage_bps = 12.0
+exit_slippage_bps = 14.0
+no_new_entry_expiry_secs = 30
+reduce_size_expiry_secs = 45
+max_hold_secs = 10
+max_stale_fair_secs = 2
+min_fair_improve = 0.001
+scratch_edge = 0.001
+trailing_drawdown_frac = 0.10
+max_void_score = 0.45
+min_wall_score = 0.15
+max_cancel_skew = 0.75
+min_bid_size = 5.0
+min_visible_depth = 10.0
+min_queue_fill_score = 0.15
+min_queue_trade_intensity = 1.0
+min_opportunity_score = 0.58
+aggressive_entry_score = 0.82
+winner_hold_edge = 0.008
+winner_hold_wall_score = 0.20
+flow_target_per_min = 0.10
+flow_window_secs = 300
+min_cycle_rate_per_min = 0.40
+maker_band_dist = 0.08
+flow_reversion_edge = 0.002
+flow_exit_edge = 0.0015
+flow_size_mult = 0.60
+flow_max_hold_secs = 30
+
+[sweep.reversal]
+enabled = true
+capture_secs = 75
+start_secs = 75
+end_secs = 150
+min_drawdown_bps = 6.0
+min_rebound_bps = 2.0
+min_rebound_frac = 0.35
+min_wick_bias = 0.08
+min_signal_score = 0.55
+ttl_ms = 800
+
+[sweep.regime.continuation]
+edge_mult = 0.8
+spread_mult = 1.2
+ticket_mult = 1.25
+exit_only = false
+
+[sweep.regime.reversion]
+edge_mult = 1.0
+spread_mult = 1.0
+ticket_mult = 0.9
+exit_only = false
+
+[sweep.regime.chop]
+edge_mult = 1.45
+spread_mult = 0.65
+ticket_mult = 0.5
+exit_only = false
+
+[sweep.regime.burst]
+edge_mult = 0.7
+spread_mult = 1.25
+ticket_mult = 1.5
+exit_only = false
+
+[sweep.regime.expiry_pinch]
+edge_mult = 2.0
+spread_mult = 0.45
+ticket_mult = 0.0
+exit_only = true
 
 [risk]
 inv_limit = 100.0
-base_qty = 10.0
-max_loss = 0.03
+base_qty = 25.0
+max_loss = 0.05
+max_loss_5m = 0.02
+asset_notional_limit = 25.0
+regime_notional_limit = 40.0
+corr_bucket_notional_limit = 25.0
 
 [model_weights]
 ret_z_1s = 0.28

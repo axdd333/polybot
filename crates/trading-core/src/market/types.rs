@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,11 +117,18 @@ pub struct MarketState {
     pub cross_window_torsion: f64,
     pub liquidity_void_score: f64,
     pub wall_persistence_score: f64,
+    pub cancel_skew: f64,
+    pub expiry_pressure: f64,
     pub regime: Regime,
     pub model_score: f64,
     pub fair_value: f64,
     pub edge_buy: f64,
     pub edge_sell: f64,
+    pub min_tick_size: f64,
+    pub min_order_size: f64,
+    pub maker_fee_bps: f64,
+    pub taker_fee_bps: f64,
+    pub accepting_orders: bool,
 }
 
 impl MarketState {
@@ -146,11 +153,18 @@ impl MarketState {
             cross_window_torsion: 0.0,
             liquidity_void_score: 1.0,
             wall_persistence_score: 0.0,
+            cancel_skew: 0.0,
+            expiry_pressure: 0.0,
             regime: Regime::Chop,
             model_score: 0.0,
             fair_value: 0.5,
             edge_buy: 0.0,
             edge_sell: 0.0,
+            min_tick_size: 0.01,
+            min_order_size: 1.0,
+            maker_fee_bps: 0.0,
+            taker_fee_bps: 0.0,
+            accepting_orders: true,
         }
     }
 }
@@ -177,6 +191,10 @@ pub struct PositionState {
     pub realized: f64,
     pub max_adverse_excursion: f64,
     pub max_favorable_excursion: f64,
+    pub opened_at: Option<Instant>,
+    pub best_fair: f64,
+    pub last_fair: f64,
+    pub last_fair_improve_at: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------

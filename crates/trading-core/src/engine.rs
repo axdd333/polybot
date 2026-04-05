@@ -1,11 +1,14 @@
 use crate::analyzer::{self, TradeObservation};
 use crate::config::{ModelWeights, RunMode};
 use crate::events::{LiveOrderStatus, MarketDiscovered, NormalizedEvent};
-use crate::executor::{ExecutionReport, ExecutionRequest, Executor, FillContext, RecentTrade};
+use crate::executor::{
+    ExecutionReport, ExecutionRequest, Executor, FillContext, LiquidityRole, PaperOrderStatus,
+    RecentTrade,
+};
 use crate::market::types::{MarketId, OrderAction, Side};
 use crate::market::{book, features, model, quote};
 use crate::state::{EngineState, TrackedMarket};
-use crate::traits::{RiskPolicy, SnapshotProjector, Strategy, StrategyContext};
+use crate::traits::{RiskPolicy, Strategy, StrategyContext};
 use std::time::{Duration, Instant};
 
 const PNL_TARGET_5M: f64 = 1.50;
@@ -19,7 +22,6 @@ pub struct EngineParts {
     pub strategy: Box<dyn Strategy>,
     pub risk_policy: Box<dyn RiskPolicy>,
     pub executor: Box<dyn Executor>,
-    pub projector: Box<dyn SnapshotProjector>,
 }
 
 pub struct TradingEngine {
@@ -28,7 +30,6 @@ pub struct TradingEngine {
     strategy: Box<dyn Strategy>,
     risk_policy: Box<dyn RiskPolicy>,
     executor: Box<dyn Executor>,
-    projector: Box<dyn SnapshotProjector>,
 }
 
 impl TradingEngine {
@@ -39,13 +40,13 @@ impl TradingEngine {
             strategy: parts.strategy,
             risk_policy: parts.risk_policy,
             executor: parts.executor,
-            projector: parts.projector,
         }
     }
 
     pub fn apply_event(&mut self, event: NormalizedEvent) {
         match event {
             NormalizedEvent::UnderlyingTick { symbol, px, ts } => {
+                self.state.now = ts;
                 self.apply_underlying_tick(symbol, px, ts)
             }
             NormalizedEvent::BookSnapshot {
@@ -54,6 +55,7 @@ impl TradingEngine {
                 asks,
                 ts,
             } => {
+                self.state.now = ts;
                 let tracked = self.ensure_market(market_id);
                 book::apply_snapshot(&mut tracked.state.book, bids, asks, ts);
                 analyzer::update_book_runtime(&mut tracked.state, &mut tracked.runtime, ts);
@@ -65,6 +67,7 @@ impl TradingEngine {
                 asks,
                 ts,
             } => {
+                self.state.now = ts;
                 let tracked = self.ensure_market(market_id);
                 book::apply_delta(&mut tracked.state.book, bids, asks, ts);
                 analyzer::update_book_runtime(&mut tracked.state, &mut tracked.runtime, ts);
@@ -74,34 +77,62 @@ impl TradingEngine {
                 market_id,
                 price,
                 size,
+                fee_rate_bps,
                 ts,
             } => {
+                self.state.now = ts;
                 let tracked = self.ensure_market(market_id);
                 tracked
                     .runtime
                     .trade_tape
                     .push_back(TradeObservation { ts, price, size });
                 analyzer::trim_trade_tape(&mut tracked.runtime.trade_tape, ts);
+                if let Some(fee_rate_bps) = fee_rate_bps {
+                    tracked.state.taker_fee_bps = fee_rate_bps;
+                }
                 self.state.markets.dirty.insert(market_id);
             }
-            NormalizedEvent::MarketDiscovered { market, .. } => self.register_market(market),
-            NormalizedEvent::MarketExpired { market_id, .. } => self.expire_market(market_id),
+            NormalizedEvent::TickSizeChange {
+                market_id,
+                new_tick_size,
+                ts,
+            } => {
+                self.state.now = ts;
+                let tracked = self.ensure_market(market_id);
+                tracked.state.min_tick_size = new_tick_size.max(0.0001);
+                self.state.markets.dirty.insert(market_id);
+            }
+            NormalizedEvent::MarketDiscovered { market, ts } => {
+                self.state.now = ts;
+                self.register_market(market, ts);
+            }
+            NormalizedEvent::MarketExpired { market_id, ts } => {
+                self.state.now = ts;
+                self.expire_market(market_id);
+            }
             NormalizedEvent::LiveOrderUpdate {
                 market_id,
                 order_id,
                 status,
                 size_matched,
-                ..
-            } => self.apply_live_order_update(market_id, order_id, status, size_matched),
+                ts,
+            } => {
+                self.state.now = ts;
+                self.apply_live_order_update(market_id, order_id, status, size_matched);
+            }
             NormalizedEvent::LiveTrade {
                 market_id,
                 order_id,
                 action,
                 price,
                 qty,
-                ..
-            } => self.apply_live_trade(market_id, order_id, action, price, qty),
-            NormalizedEvent::TimerTick { .. } => {
+                ts,
+            } => {
+                self.state.now = ts;
+                self.apply_live_trade(market_id, order_id, action, price, qty);
+            }
+            NormalizedEvent::TimerTick { ts, .. } => {
+                self.state.now = ts;
                 self.state
                     .markets
                     .dirty
@@ -122,14 +153,6 @@ impl TradingEngine {
         }
     }
 
-    pub fn snapshot(&self) -> crate::snapshot::WorldSnapshot {
-        self.projector.project(self, self.strategy.as_ref())
-    }
-
-    pub fn strategy(&self) -> &dyn Strategy {
-        self.strategy.as_ref()
-    }
-
     pub fn realized_pnl_5m(&self, now: Instant) -> f64 {
         self.state
             .portfolio
@@ -144,8 +167,8 @@ impl TradingEngine {
         let tracked = self.state.markets.markets.get(&market_id)?;
         let ret1 = tracked.state.underlying.ret_1s;
         let ret5 = tracked.state.underlying.ret_5s;
-        let vol = tracked.state.underlying.vol_5s.max(1e-6);
-        let signal = (ret1 * 0.65 + ret5 * 0.35) / vol;
+        let vol = tracked.state.underlying.vol_5s.max(0.0025);
+        let signal = ((ret1 * 0.65 + ret5 * 0.35) / vol).clamp(-9.0, 9.0);
         if signal.abs() < 0.5 {
             return None;
         }
@@ -164,7 +187,7 @@ impl TradingEngine {
             .or_insert_with(|| TrackedMarket::placeholder(market_id))
     }
 
-    fn register_market(&mut self, market: MarketDiscovered) {
+    fn register_market(&mut self, market: MarketDiscovered, ts: Instant) {
         let market_id = market.instrument_id.market;
         let tracked = self
             .state
@@ -187,10 +210,17 @@ impl TradingEngine {
         tracked.state.side = market.side;
         tracked.state.time_to_expiry = Duration::from_secs(market.time_to_expiry_secs);
         tracked.state.expiry_anchored_at = Instant::now();
+        tracked.state.min_tick_size = market.min_tick_size.max(0.0001);
+        tracked.state.min_order_size = market.min_order_size.max(0.0);
+        tracked.state.maker_fee_bps = market.maker_fee_bps.max(0.0);
+        tracked.state.taker_fee_bps = market.taker_fee_bps.max(0.0);
+        tracked.state.accepting_orders = market.accepting_orders;
         tracked.runtime.title = market.title;
         tracked.runtime.symbol = market.symbol;
         tracked.runtime.window_label = market.window_label;
         tracked.runtime.end_label = market.end_label;
+        tracked.runtime.window_secs = window_secs(&tracked.runtime.window_label);
+        sync_market_open(tracked, ts);
         self.state.markets.dirty.insert(market_id);
     }
 
@@ -210,15 +240,13 @@ impl TradingEngine {
     }
 
     fn apply_underlying_tick(&mut self, symbol: String, px: f64, ts: Instant) {
-        let state = analyzer::update_underlying_state(
-            self.state
-                .underlyings
-                .tapes
-                .entry(symbol.clone())
-                .or_default(),
-            px,
-            ts,
-        );
+        let tape = self
+            .state
+            .underlyings
+            .tapes
+            .entry(symbol.clone())
+            .or_default();
+        let state = analyzer::update_underlying_state(tape, px, ts);
 
         for (&market_id, tracked) in &mut self.state.markets.markets {
             if tracked.runtime.symbol != symbol {
@@ -228,6 +256,17 @@ impl TradingEngine {
             tracked.runtime.cross_window.m5_score = state.ret_1s;
             tracked.runtime.cross_window.m15_score = state.ret_5s;
             tracked.runtime.cross_window.torsion = (state.ret_1s - state.ret_5s).clamp(-2.0, 2.0);
+            if tracked.runtime.window_secs == 5 * 60 {
+                analyzer::sync_opening_state(&mut tracked.runtime, px, ts);
+                if !tracked.runtime.prev_wick_ready {
+                    tracked.runtime.prev_wick_bias = tracked
+                        .runtime
+                        .open_at
+                        .and_then(|open_at| analyzer::prev_candle_wick_bias(tape, open_at))
+                        .unwrap_or(0.0);
+                    tracked.runtime.prev_wick_ready = true;
+                }
+            }
             tracked.state.underlying = state.clone();
             tracked.state.cross_window_torsion = tracked.runtime.cross_window.torsion;
             self.state.markets.dirty.insert(market_id);
@@ -239,7 +278,8 @@ impl TradingEngine {
             return;
         };
 
-        tracked.state.spread_ticks = book::spread_ticks(&tracked.state.book, 0.01);
+        tracked.state.spread_ticks =
+            book::spread_ticks(&tracked.state.book, tracked.state.min_tick_size.max(0.0001));
         tracked.state.microprice = book::microprice(&tracked.state.book);
         tracked.state.imbalance_top = book::top_imbalance(&tracked.state.book);
         tracked.state.imbalance_5lvl = book::five_level_imbalance(&tracked.state.book);
@@ -256,6 +296,8 @@ impl TradingEngine {
 
         let mark = analyzer::liquidation_mark(&tracked.state.book, tracked.state.fair_value);
         let feature = features::compute(&tracked.state);
+        tracked.state.cancel_skew = feature.cancel_skew;
+        tracked.state.expiry_pressure = feature.expiry_pressure;
         analyzer::push_history(
             &mut tracked.runtime.flow_history,
             now,
@@ -266,6 +308,7 @@ impl TradingEngine {
             now,
             feature.microprice_gap,
         );
+        analyzer::push_history(&mut tracked.runtime.price_history, now, mark);
         tracked.features = Some(feature);
         self.state.portfolio.mark_price(market_id, mark);
     }
@@ -289,9 +332,16 @@ impl TradingEngine {
         };
 
         let score = model::score(features, &self.model_weights);
-        let fair = model::fair_value_for_side(tracked.state.side, score);
         let bid = book::best_bid(&tracked.state.book);
         let ask = book::best_ask(&tracked.state.book);
+        let fair = model::anchored_fair_value(
+            tracked.state.side,
+            score,
+            bid,
+            ask,
+            tracked.state.expiry_pressure,
+            &self.model_weights,
+        );
 
         tracked.state.model_score = score;
         tracked.state.fair_value = fair;
@@ -305,10 +355,14 @@ impl TradingEngine {
         } else {
             0.0
         };
-
         let now = tracked.state.book.last_update;
+        self.state.portfolio.observe_fair(market_id, fair, now);
         analyzer::push_history(&mut tracked.runtime.fair_history, now, fair);
-        analyzer::push_history(&mut tracked.runtime.edge_history, now, tracked.state.edge_buy);
+        analyzer::push_history(
+            &mut tracked.runtime.edge_history,
+            now,
+            tracked.state.edge_buy,
+        );
     }
 
     fn plan_orders(&mut self, market_id: MarketId) {
@@ -320,9 +374,10 @@ impl TradingEngine {
             market_id,
             markets: &self.state.markets.markets,
             portfolio: &self.state.portfolio,
+            now: self.state.now,
         };
         let (surface, note) = self.strategy.plan(ctx, &tracked.state);
-        let now = tracked.state.book.last_update;
+        let now = self.state.now;
 
         if let Some(tracked) = self.state.markets.markets.get_mut(&market_id) {
             tracked.planned_surface = surface;
@@ -337,11 +392,17 @@ impl TradingEngine {
             return;
         };
         let position = self.state.portfolio.position(market_id);
+        let ctx = StrategyContext {
+            market_id,
+            markets: &self.state.markets.markets,
+            portfolio: &self.state.portfolio,
+            now: self.state.now,
+        };
         let filtered = self.risk_policy.apply(
+            ctx,
             &tracked.state,
             position,
             tracked.planned_surface.clone(),
-            &self.state.portfolio,
         );
 
         if let Some(tracked) = self.state.markets.markets.get_mut(&market_id) {
@@ -355,9 +416,8 @@ impl TradingEngine {
         };
 
         let surface = tracked.planned_surface.clone();
-        let best_bid = book::best_bid(&tracked.state.book);
         let best_ask = book::best_ask(&tracked.state.book);
-        let now = tracked.state.book.last_update;
+        let now = self.state.now;
         let side = tracked.state.side;
         let symbol = tracked.runtime.symbol.clone();
         let window = tracked.runtime.window_label.clone();
@@ -365,10 +425,11 @@ impl TradingEngine {
             .runtime
             .trade_tape
             .iter()
-            .filter(|t| now.duration_since(t.ts) <= Duration::from_secs(1))
+            .filter(|t| now.duration_since(t.ts) <= Duration::from_secs(8))
             .map(|t| RecentTrade {
                 price: t.price,
                 size: t.size,
+                ts: t.ts,
             })
             .collect();
 
@@ -376,9 +437,14 @@ impl TradingEngine {
             .portfolio
             .replace_surface(market_id, surface.clone());
         let ctx = FillContext {
-            best_bid,
-            best_ask,
+            book: tracked.state.book.clone(),
             recent_trades,
+            now,
+            min_tick_size: tracked.state.min_tick_size,
+            min_order_size: tracked.state.min_order_size,
+            maker_fee_bps: tracked.state.maker_fee_bps,
+            taker_fee_bps: tracked.state.taker_fee_bps,
+            accepting_orders: tracked.state.accepting_orders,
         };
         let pending = self.state.run.live_orders.get(&market_id);
         let reports = match self
@@ -406,22 +472,74 @@ impl TradingEngine {
         let mut filled = Vec::new();
         for report in reports {
             match report {
-                ExecutionReport::PaperFill { action, price, qty } => {
+                ExecutionReport::PaperFill {
+                    order_id,
+                    action,
+                    price,
+                    qty,
+                    fee,
+                    role,
+                } => {
                     let filled_qty = self
                         .state
                         .portfolio
-                        .apply_fill(market_id, action, price, qty, now);
+                        .apply_fill(market_id, action, price, qty, fee, now);
                     if filled_qty > 0.0 {
                         filled.push(format!(
-                            "{} {:.1} @ {:.3}",
+                            "{} {:.1} @ {:.3} fee {:.4} {} id={}",
                             match action {
                                 OrderAction::Buy => "BUY",
                                 OrderAction::Sell => "SELL",
                             },
                             filled_qty,
-                            price
+                            price,
+                            fee,
+                            match role {
+                                LiquidityRole::Maker => "maker",
+                                LiquidityRole::Taker => "taker",
+                            },
+                            order_id
                         ));
                     }
+                }
+                ExecutionReport::PaperOrderAccepted { order_id, status } => {
+                    self.state.run.journal.push(format!(
+                        "paper order accepted {} {} id={} status={}",
+                        symbol,
+                        window,
+                        order_id,
+                        paper_status_label(status)
+                    ));
+                }
+                ExecutionReport::PaperOrderUpdate {
+                    order_id,
+                    status,
+                    filled_qty,
+                    remaining_qty,
+                    note,
+                } => {
+                    self.state.run.journal.push(format!(
+                        "paper order {} {} id={} status={} filled {:.1} rem {:.1} {}",
+                        symbol,
+                        window,
+                        order_id,
+                        paper_status_label(status),
+                        filled_qty,
+                        remaining_qty,
+                        note
+                    ));
+                }
+                ExecutionReport::PaperOrderRejected { reason } => {
+                    self.state.run.journal.push(format!(
+                        "paper order rejected {} {}: {}",
+                        symbol, window, reason
+                    ));
+                }
+                ExecutionReport::PaperLog { line } => {
+                    self.state
+                        .run
+                        .journal
+                        .push(format!("{} {} {}", symbol, window, line));
                 }
                 ExecutionReport::LiveOrderAccepted {
                     order_id,
@@ -454,16 +572,16 @@ impl TradingEngine {
                 }
                 ExecutionReport::LiveOrderCancelled { order_id } => {
                     self.state.run.live_orders.remove(&market_id);
-                    self.state
-                        .run
-                        .journal
-                        .push(format!("live order cancelled {} {} id={}", symbol, window, order_id));
+                    self.state.run.journal.push(format!(
+                        "live order cancelled {} {} id={}",
+                        symbol, window, order_id
+                    ));
                 }
                 ExecutionReport::LiveOrderRejected { reason } => {
-                    self.state
-                        .run
-                        .journal
-                        .push(format!("live order rejected {} {}: {}", symbol, window, reason));
+                    self.state.run.journal.push(format!(
+                        "live order rejected {} {}: {}",
+                        symbol, window, reason
+                    ));
                 }
             }
         }
@@ -472,8 +590,14 @@ impl TradingEngine {
             return;
         }
 
+        let target = surface
+            .intents
+            .iter()
+            .find(|i| matches!(i.action, OrderAction::Sell))
+            .map(|i| i.price)
+            .unwrap_or(0.0);
         let summary = format!(
-            "{} {} {} | ask {} target {} ticket ${:.2} | queued {} | fills {}",
+            "{} {} {} | ask {} target {} | queued {} | fills {}",
             symbol,
             window,
             match side {
@@ -481,15 +605,7 @@ impl TradingEngine {
                 Side::Down => "D",
             },
             quote::cents_or_dash(best_ask),
-            quote::cents_or_dash(
-                surface
-                    .intents
-                    .iter()
-                    .find(|i| matches!(i.action, OrderAction::Sell))
-                    .map(|i| i.price)
-                    .unwrap_or(self.strategy.exit_threshold())
-            ),
-            self.strategy.ticket_dollars(),
+            quote::cents_or_dash(target),
             surface.intents.len(),
             if filled.is_empty() {
                 "none".to_string()
@@ -531,10 +647,10 @@ impl TradingEngine {
         price: f64,
         qty: f64,
     ) {
-        let filled_qty = self
-            .state
-            .portfolio
-            .apply_fill(market_id, action, price, qty, Instant::now());
+        let filled_qty =
+            self.state
+                .portfolio
+                .apply_fill(market_id, action, price, qty, 0.0, Instant::now());
         if let Some(order_id) = order_id {
             if let Some(pending) = self.state.run.live_orders.get_mut(&market_id) {
                 if pending.order_id == order_id {
@@ -554,7 +670,8 @@ impl TradingEngine {
             .iter()
             .map(|(id, tracked)| {
                 let qty = self.state.portfolio.inventory_for(*id).abs();
-                qty * analyzer::liquidation_mark(&tracked.state.book, tracked.state.fair_value).max(0.0)
+                qty * analyzer::liquidation_mark(&tracked.state.book, tracked.state.fair_value)
+                    .max(0.0)
             })
             .sum()
     }
@@ -600,4 +717,52 @@ impl TradingEngine {
             self.state.run.journal.drain(0..drain);
         }
     }
+}
+
+fn paper_status_label(status: PaperOrderStatus) -> &'static str {
+    match status {
+        PaperOrderStatus::Submitted => "submitted",
+        PaperOrderStatus::Live => "live",
+        PaperOrderStatus::PartiallyFilled => "partial",
+        PaperOrderStatus::Filled => "filled",
+        PaperOrderStatus::Cancelled => "cancelled",
+        PaperOrderStatus::Expired => "expired",
+        PaperOrderStatus::Rejected => "rejected",
+        PaperOrderStatus::Stale => "stale",
+    }
+}
+
+fn sync_market_open(tracked: &mut TrackedMarket, ts: Instant) {
+    let span = tracked.runtime.window_secs;
+    if span == 0 {
+        return;
+    }
+    let age = span.saturating_sub(tracked.state.time_to_expiry.as_secs());
+    let open_at = ts.checked_sub(Duration::from_secs(age)).unwrap_or(ts);
+    let next = match tracked.runtime.open_at {
+        Some(cur) => cur.min(open_at),
+        None => open_at,
+    };
+    if tracked.runtime.open_at != Some(next) {
+        tracked.runtime.prev_wick_ready = false;
+    }
+    tracked.runtime.open_at = Some(next);
+}
+
+fn window_secs(label: &str) -> u64 {
+    parse_window_secs(label).unwrap_or_default()
+}
+
+fn parse_window_secs(label: &str) -> Option<u64> {
+    let (start, end) = label.split_once('-')?;
+    let start = parse_clock(start)?;
+    let end = parse_clock(end)?;
+    Some(end.saturating_sub(start).max(1) * 60)
+}
+
+fn parse_clock(value: &str) -> Option<u64> {
+    let (hrs, mins) = value.split_once(':')?;
+    let hrs = hrs.parse::<u64>().ok()?;
+    let mins = mins.parse::<u64>().ok()?;
+    Some((hrs * 60 + mins) % (24 * 60))
 }

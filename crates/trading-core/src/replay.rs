@@ -40,16 +40,31 @@ pub fn read_recorded_events(path: impl AsRef<Path>) -> Result<Vec<NormalizedEven
     let mut first_ts = None;
     let base_instant = Instant::now();
 
-    for line in reader.lines() {
+    for (idx, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let recorded: RecordedEvent = serde_json::from_str(&line)
-            .with_context(|| format!("failed to parse recorded event in {}", path.display()))?;
+        let recorded = match parse_recorded(path, idx + 1, &line) {
+            Ok(recorded) => recorded,
+            Err(err) if can_skip_truncated_tail(&err, &events) => break,
+            Err(err) => return Err(err),
+        };
         let first = *first_ts.get_or_insert(recorded.ts_millis());
         events.push(recorded.into_runtime(base_instant, first));
     }
 
     Ok(events)
+}
+
+fn parse_recorded(path: &Path, line_no: usize, line: &str) -> Result<RecordedEvent> {
+    serde_json::from_str(line)
+        .with_context(|| format!("failed to parse {}:{}", path.display(), line_no))
+}
+
+fn can_skip_truncated_tail(err: &anyhow::Error, events: &[NormalizedEvent]) -> bool {
+    !events.is_empty()
+        && err
+            .chain()
+            .any(|cause| cause.to_string().contains("EOF while parsing"))
 }

@@ -2,11 +2,9 @@
 members = [
     "crates/trading-core",
     "crates/polymarket-adapter",
-    "crates/strategy-sweep",
-    "crates/app-tui",
-    "crates/app-cli",
+    "crates/app",
 ]
-default-members = ["crates/app-tui"]
+default-members = ["crates/app"]
 resolver = "2"
 
 [workspace.package]

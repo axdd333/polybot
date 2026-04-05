@@ -5,14 +5,16 @@ use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
 use polymarket_client_sdk::clob::types::Side as ClobSide;
-use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, LastTradePrice, OrderMessageType};
+use polymarket_client_sdk::clob::ws::types::response::{
+    BookUpdate, LastTradePrice, OrderMessageType, TickSizeChange,
+};
 use polymarket_client_sdk::clob::ws::Client as ClobWsClient;
 use polymarket_client_sdk::clob::Client as ClobClient;
 use polymarket_client_sdk::gamma::types::request::EventsRequest;
 use polymarket_client_sdk::gamma::types::response::Event as GammaEvent;
 use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::rtds::Client as RtdsClient;
-use polymarket_client_sdk::types::{Address, B256, Decimal, U256};
+use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
 use polymarket_client_sdk::POLYGON;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
@@ -23,10 +25,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use trading_core::config::{AdapterProfile, AssetConfig, LiveProfile, WalletSignatureType};
+use trading_core::config::{AdapterProfile, LiveProfile, WalletSignatureType};
 use trading_core::events::{LiveOrderStatus, MarketDiscovered, NormalizedEvent};
 use trading_core::market::quote;
-use trading_core::market::types::{AssetSymbol, InstrumentId, L2Level, MarketId, OrderAction, Side, Venue};
+use trading_core::market::types::{
+    AssetSymbol, InstrumentId, L2Level, MarketId, OrderAction, Side, Venue,
+};
 
 const ERROR_NOTE_MAX_CHARS: usize = 96;
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 30;
@@ -39,6 +43,11 @@ struct LiveMarket {
     window_label: String,
     end_label: String,
     time_to_expiry: Duration,
+    min_tick_size: f64,
+    min_order_size: f64,
+    maker_fee_bps: f64,
+    taker_fee_bps: f64,
+    accepting_orders: bool,
     up_market_id: MarketId,
     down_market_id: MarketId,
     up_token_id: U256,
@@ -79,16 +88,14 @@ pub fn spawn_live_feeds(
     }
 
     if config.chainlink_fallback_enabled {
-        handles.push(tokio::spawn(chainlink_fallback_loop(config.clone(), tx.clone())));
+        handles.push(tokio::spawn(chainlink_fallback_loop(
+            config.clone(),
+            tx.clone(),
+        )));
     }
 
     if let Some(live) = live.filter(|live| live.enabled) {
-        handles.push(tokio::spawn(user_ws_loop(
-            live,
-            tx,
-            registry,
-            condition_rx,
-        )));
+        handles.push(tokio::spawn(user_ws_loop(live, tx, registry, condition_rx)));
     }
 
     handles
@@ -118,7 +125,8 @@ async fn universe_refresh(
                         fresh_active.insert(market.up_market_id);
                         fresh_active.insert(market.down_market_id);
                         reg.tokens.insert(market.up_token_id, market.up_market_id);
-                        reg.tokens.insert(market.down_token_id, market.down_market_id);
+                        reg.tokens
+                            .insert(market.down_token_id, market.down_market_id);
                         condition_ids.push(market.condition_id.clone());
                         ids.push(market.up_token_id);
                         ids.push(market.down_token_id);
@@ -157,7 +165,7 @@ async fn universe_refresh(
                 backfill_books(&clob, &tx, &registry, &ids).await;
             }
             Err(err) => {
-                let _ = concise_error(&err.to_string());
+                eprintln!("{}", concise_error(&err.to_string()));
             }
         }
 
@@ -298,10 +306,19 @@ async fn clob_ws_loop(
                 continue;
             }
         };
+        let ticks = match client.subscribe_tick_size_change(asset_ids.clone()) {
+            Ok(stream) => Box::pin(stream.fuse()),
+            Err(_) => {
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(reconnect_delay(failures)).await;
+                continue;
+            }
+        };
 
         failures = 0;
         let mut books = books;
         let mut trades = trades;
+        let mut ticks = ticks;
         let mut ended_cleanly = false;
 
         loop {
@@ -327,6 +344,14 @@ async fn clob_ws_loop(
                         Some(Err(_)) | None => break,
                     }
                 }
+                item = ticks.next() => {
+                    match item {
+                        Some(Ok(tick)) => {
+                            translate_tick_size(tick, &tx, &registry).await;
+                        }
+                        Some(Err(_)) | None => break,
+                    }
+                }
             }
         }
 
@@ -342,6 +367,7 @@ async fn rtds_loop(config: AdapterProfile, tx: mpsc::Sender<NormalizedEvent>) {
     let symbols = config
         .assets
         .iter()
+        .filter(|asset| !asset.rtds_symbol.is_empty())
         .map(|asset| asset.rtds_symbol.clone())
         .collect::<Vec<_>>();
     let mut stream = match client.subscribe_crypto_prices(Some(symbols)) {
@@ -374,9 +400,18 @@ async fn rtds_loop(config: AdapterProfile, tx: mpsc::Sender<NormalizedEvent>) {
 async fn chainlink_fallback_loop(config: AdapterProfile, tx: mpsc::Sender<NormalizedEvent>) {
     let http = HttpClient::new();
     loop {
-        let tasks = config.assets.iter().map(|asset| async {
-            let price = chainlink_price(&http, &config.polygon_rpc_url, &asset.oracle).await;
-            (asset.name.clone(), price)
+        let tasks = config.assets.iter().filter_map(|asset| {
+            let oracle = asset.oracle.clone()?;
+            if oracle.is_empty() {
+                return None;
+            }
+            let http = http.clone();
+            let rpc_url = config.polygon_rpc_url.clone();
+            let symbol = asset.name.clone();
+            Some(async move {
+                let price = chainlink_price(&http, &rpc_url, &oracle).await;
+                (symbol, price)
+            })
         });
         for (symbol, result) in future::join_all(tasks).await {
             if let Ok(price) = result {
@@ -417,6 +452,11 @@ fn discovery_from_live_market(market: &LiveMarket, side: Side) -> MarketDiscover
         end_label: market.end_label.clone(),
         side,
         time_to_expiry_secs: market.time_to_expiry.as_secs(),
+        min_tick_size: market.min_tick_size,
+        min_order_size: market.min_order_size,
+        maker_fee_bps: market.maker_fee_bps,
+        taker_fee_bps: market.taker_fee_bps,
+        accepting_orders: market.accepting_orders,
     }
 }
 
@@ -437,10 +477,7 @@ async fn translate_user_order(
             market_id,
             order_id: order.id,
             status: map_live_order_status(order.msg_type.as_ref()),
-            size_matched: order
-                .size_matched
-                .map(quote::decimal_to_f64)
-                .unwrap_or(0.0),
+            size_matched: order.size_matched.map(quote::decimal_to_f64).unwrap_or(0.0),
             ts: Instant::now(),
         })
         .await;
@@ -458,10 +495,12 @@ async fn translate_user_trade(
     let Some(market_id) = market_id else {
         return;
     };
-    let order_id = trade
-        .taker_order_id
-        .clone()
-        .or_else(|| trade.maker_orders.first().map(|maker| maker.order_id.clone()));
+    let order_id = trade.taker_order_id.clone().or_else(|| {
+        trade
+            .maker_orders
+            .first()
+            .map(|maker| maker.order_id.clone())
+    });
     let action = match trade.side {
         ClobSide::Buy => OrderAction::Buy,
         ClobSide::Sell => OrderAction::Sell,
@@ -494,8 +533,16 @@ async fn translate_book(
         return;
     };
 
-    let bids = book.bids.into_iter().map(level_from_book).collect::<Vec<_>>();
-    let asks = book.asks.into_iter().map(level_from_book).collect::<Vec<_>>();
+    let bids = book
+        .bids
+        .into_iter()
+        .map(level_from_book)
+        .collect::<Vec<_>>();
+    let asks = book
+        .asks
+        .into_iter()
+        .map(level_from_book)
+        .collect::<Vec<_>>();
     let _ = tx
         .send(NormalizedEvent::BookSnapshot {
             market_id,
@@ -524,6 +571,29 @@ async fn translate_trade(
             market_id,
             price: quote::decimal_to_f64(trade.price),
             size: trade.size.map(quote::decimal_to_f64).unwrap_or(0.0),
+            fee_rate_bps: trade.fee_rate_bps.map(quote::decimal_to_f64),
+            ts: Instant::now(),
+        })
+        .await;
+}
+
+async fn translate_tick_size(
+    tick: TickSizeChange,
+    tx: &mpsc::Sender<NormalizedEvent>,
+    registry: &Arc<RwLock<Registry>>,
+) {
+    let market_id = {
+        let reg = registry.read().await;
+        reg.tokens.get(&tick.asset_id).copied()
+    };
+    let Some(market_id) = market_id else {
+        return;
+    };
+
+    let _ = tx
+        .send(NormalizedEvent::TickSizeChange {
+            market_id,
+            new_tick_size: quote::decimal_to_f64(tick.new_tick_size),
             ts: Instant::now(),
         })
         .await;
@@ -536,7 +606,9 @@ async fn backfill_books(
     asset_ids: &[U256],
 ) {
     for token_id in asset_ids {
-        let request = OrderBookSummaryRequest::builder().token_id(*token_id).build();
+        let request = OrderBookSummaryRequest::builder()
+            .token_id(*token_id)
+            .build();
         if let Ok(book) = clob.order_book(&request).await {
             translate_backfill_book(book, tx, registry).await;
         }
@@ -583,7 +655,10 @@ async fn translate_backfill_book(
         .await;
 }
 
-async fn fetch_active_markets(gamma: &GammaClient, config: &AdapterProfile) -> Result<Vec<LiveMarket>> {
+async fn fetch_active_markets(
+    gamma: &GammaClient,
+    config: &AdapterProfile,
+) -> Result<Vec<LiveMarket>> {
     let now = Utc::now();
     let request = EventsRequest::builder()
         .closed(false)
@@ -594,13 +669,13 @@ async fn fetch_active_markets(gamma: &GammaClient, config: &AdapterProfile) -> R
         .limit(500)
         .build();
     let events = gamma.events(&request).await?;
-    Ok(normalize_events(events, now, &config.assets))
+    Ok(normalize_events(events, now, config))
 }
 
 fn normalize_events(
     events: Vec<GammaEvent>,
     now: DateTime<Utc>,
-    assets: &[AssetConfig],
+    cfg: &AdapterProfile,
 ) -> Vec<LiveMarket> {
     let now_unix = now.timestamp();
     let mut markets = Vec::new();
@@ -609,10 +684,12 @@ fn normalize_events(
         let Some(slug) = event.slug.as_deref() else {
             continue;
         };
-        let Some(asset) = assets
-            .iter()
-            .find(|asset| asset.slug_prefixes.iter().any(|prefix| slug.starts_with(prefix)))
-        else {
+        let Some(asset) = cfg.assets.iter().find(|asset| {
+            asset
+                .slug_prefixes
+                .iter()
+                .any(|prefix| slug.starts_with(prefix))
+        }) else {
             continue;
         };
         let Some(market) = event.markets.as_ref().and_then(|markets| markets.first()) else {
@@ -637,14 +714,25 @@ fn normalize_events(
         ) else {
             continue;
         };
+        let min_tick_size = market
+            .order_price_min_tick_size
+            .map(quote::decimal_to_f64)
+            .unwrap_or(0.01);
+        let min_order_size = market
+            .order_min_size
+            .map(quote::decimal_to_f64)
+            .unwrap_or(1.0);
+        let maker_fee_bps = market.maker_base_fee.unwrap_or(0) as f64;
+        let taker_fee_bps = market.taker_base_fee.unwrap_or(0) as f64;
+        let accepting_orders = market.accepting_orders.unwrap_or(true);
         let start_unix = slug
             .rsplit('-')
             .next()
             .and_then(|part| part.parse::<i64>().ok())
             .unwrap_or(now_unix);
-
         let secs_left = (end_time - now).num_seconds();
-        if secs_left <= 0 || secs_left > 960 {
+        let window_mins = market_window_mins(start_unix, end_time.timestamp());
+        if !market_allowed(secs_left, window_mins, cfg) {
             continue;
         }
 
@@ -666,6 +754,11 @@ fn normalize_events(
             window_label: format!("{start_label}-{end_label}"),
             end_label,
             time_to_expiry: Duration::from_secs(secs_left as u64),
+            min_tick_size,
+            min_order_size,
+            maker_fee_bps,
+            taker_fee_bps,
+            accepting_orders,
             up_market_id,
             down_market_id,
             up_token_id,
@@ -674,25 +767,62 @@ fn normalize_events(
     }
 
     markets.sort_by_key(|market| market.time_to_expiry);
-    markets.truncate(48);
+    markets.truncate(cfg.max_markets);
     markets
+}
+
+fn market_window_mins(start_unix: i64, end_unix: i64) -> Option<u64> {
+    let secs = end_unix.checked_sub(start_unix)?;
+    let mins = u64::try_from(secs).ok()? / 60;
+    Some(mins)
+}
+
+fn market_allowed(secs_left: i64, window_mins: Option<u64>, cfg: &AdapterProfile) -> bool {
+    if secs_left <= 0 {
+        return false;
+    }
+    if !window_ok(window_mins, &cfg.allowed_window_mins) {
+        return false;
+    }
+    future_ok(secs_left as u64, cfg.max_future_secs)
+}
+
+fn window_ok(window_mins: Option<u64>, allowed: &[u64]) -> bool {
+    window_mins
+        .map(|mins| allowed.is_empty() || allowed.contains(&mins))
+        .unwrap_or(false)
+}
+
+fn future_ok(secs_left: u64, max_future_secs: Option<u64>) -> bool {
+    max_future_secs.map(|max| secs_left <= max).unwrap_or(true)
 }
 
 async fn authenticated_clients(
     live: &LiveProfile,
 ) -> Result<(
-    ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
-    ClobWsClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    ClobClient<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
+    ClobWsClient<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
 )> {
     let private_key = std::env::var(&live.private_key_env)
         .with_context(|| format!("missing env var {}", live.private_key_env))?;
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
-    let mut auth = ClobClient::new(&live.clob_host, Default::default())?
-        .authentication_builder(&signer);
+    let mut auth =
+        ClobClient::new(&live.clob_host, Default::default())?.authentication_builder(&signer);
     match live.signature_type {
-        WalletSignatureType::Eoa => auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::Eoa),
-        WalletSignatureType::Proxy => auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy),
-        WalletSignatureType::GnosisSafe => auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::GnosisSafe),
+        WalletSignatureType::Eoa => {
+            auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::Eoa)
+        }
+        WalletSignatureType::Proxy => {
+            auth = auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
+        }
+        WalletSignatureType::GnosisSafe => {
+            auth =
+                auth.signature_type(polymarket_client_sdk::clob::types::SignatureType::GnosisSafe)
+        }
     }
     if let Some(funder) = &live.funder {
         auth = auth.funder(funder.parse::<Address>()?);
@@ -849,7 +979,9 @@ fn concise_error(err: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{concise_error, infer_token_mapping, U256};
+    use super::{
+        concise_error, future_ok, infer_token_mapping, market_window_mins, window_ok, U256,
+    };
 
     #[test]
     fn maps_yes_no_question_with_bullish_wording() {
@@ -877,6 +1009,25 @@ mod tests {
         );
 
         assert_eq!(mapping, None);
+    }
+
+    #[test]
+    fn keeps_only_5m_and_15m_windows() {
+        assert!(window_ok(Some(5), &[5, 15]));
+        assert!(window_ok(Some(15), &[5, 15]));
+        assert!(!window_ok(Some(60), &[5, 15]));
+    }
+
+    #[test]
+    fn open_future_horizon_accepts_far_markets() {
+        assert!(future_ok(7_200, None));
+        assert!(!future_ok(7_201, Some(7_200)));
+    }
+
+    #[test]
+    fn parses_window_minutes_from_timestamps() {
+        assert_eq!(market_window_mins(1_000, 1_300), Some(5));
+        assert_eq!(market_window_mins(1_000, 1_900), Some(15));
     }
 
     #[test]

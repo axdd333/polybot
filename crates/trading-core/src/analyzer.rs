@@ -1,10 +1,12 @@
 use crate::market::quote;
-use crate::market::types::{CrossWindowState, MarketState, OrderBook, QueueTracker, UnderlyingState};
+use crate::market::types::{
+    CrossWindowState, MarketState, OrderBook, QueueTracker, UnderlyingState,
+};
 use rust_decimal::Decimal;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-const UNDERLYING_HISTORY_CAP: usize = 128;
+const UNDERLYING_HISTORY_CAP: usize = 4096;
 pub(crate) const TRADE_HISTORY_CAP: usize = 128;
 
 // ---------------------------------------------------------------------------
@@ -37,12 +39,18 @@ pub struct MarketRuntime {
     pub edge_history: VecDeque<(Instant, f64)>,
     pub flow_history: VecDeque<(Instant, f64)>,
     pub micro_history: VecDeque<(Instant, f64)>,
+    pub price_history: VecDeque<(Instant, f64)>,
     pub last_bid_depth: f64,
     pub last_ask_depth: f64,
     pub last_book_ts: Option<Instant>,
     pub wall_persistence_score: f64,
     pub last_plan_note: Option<String>,
     pub last_plan_note_at: Option<Instant>,
+    pub window_secs: u64,
+    pub open_at: Option<Instant>,
+    pub opening: OpeningRange,
+    pub prev_wick_bias: f64,
+    pub prev_wick_ready: bool,
 }
 
 impl Default for MarketRuntime {
@@ -59,12 +67,39 @@ impl Default for MarketRuntime {
             edge_history: VecDeque::new(),
             flow_history: VecDeque::new(),
             micro_history: VecDeque::new(),
+            price_history: VecDeque::new(),
             last_bid_depth: 0.0,
             last_ask_depth: 0.0,
             last_book_ts: None,
             wall_persistence_score: 0.0,
             last_plan_note: None,
             last_plan_note_at: None,
+            window_secs: 0,
+            open_at: None,
+            opening: OpeningRange::default(),
+            prev_wick_bias: 0.0,
+            prev_wick_ready: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpeningRange {
+    pub open_px: Option<f64>,
+    pub high_px: f64,
+    pub low_px: f64,
+    pub last_px: f64,
+    pub done: bool,
+}
+
+impl Default for OpeningRange {
+    fn default() -> Self {
+        Self {
+            open_px: None,
+            high_px: 0.0,
+            low_px: 0.0,
+            last_px: 0.0,
+            done: false,
         }
     }
 }
@@ -73,11 +108,7 @@ impl Default for MarketRuntime {
 // Book runtime update (cancel rates, wall persistence, depth tracking)
 // ---------------------------------------------------------------------------
 
-pub fn update_book_runtime(
-    market: &mut MarketState,
-    runtime: &mut MarketRuntime,
-    ts: Instant,
-) {
+pub fn update_book_runtime(market: &mut MarketState, runtime: &mut MarketRuntime, ts: Instant) {
     let bid_depth: f64 = market
         .book
         .bids
@@ -149,10 +180,83 @@ fn trim_underlying_tape(tape: &mut VecDeque<UnderlyingPoint>, now: Instant) {
     }
     while tape
         .front()
-        .map(|p| now.duration_since(p.ts) > Duration::from_secs(20))
+        .map(|p| now.duration_since(p.ts) > Duration::from_secs(12 * 60))
         .unwrap_or(false)
     {
         tape.pop_front();
+    }
+}
+
+pub fn sync_opening_state(runtime: &mut MarketRuntime, px: f64, ts: Instant) {
+    let Some(open_at) = runtime.open_at else {
+        return;
+    };
+    let age = ts.saturating_duration_since(open_at).as_secs();
+    if age > runtime.window_secs || runtime.window_secs == 0 {
+        return;
+    }
+    if age <= 1 {
+        runtime.opening = OpeningRange::default();
+    }
+    update_opening_range(&mut runtime.opening, px);
+    if age >= 75 {
+        runtime.opening.done = true;
+    }
+}
+
+fn update_opening_range(opening: &mut OpeningRange, px: f64) {
+    if opening.open_px.is_none() {
+        opening.open_px = Some(px);
+        opening.high_px = px;
+        opening.low_px = px;
+    }
+    opening.high_px = opening.high_px.max(px);
+    opening.low_px = opening.low_px.min(px);
+    opening.last_px = px;
+}
+
+pub fn prev_candle_wick_bias(tape: &VecDeque<UnderlyingPoint>, open_at: Instant) -> Option<f64> {
+    let start = open_at.checked_sub(Duration::from_secs(5 * 60))?;
+    let candle = candle_slice(tape, start, open_at)?;
+    let body_hi = candle.open.max(candle.close);
+    let body_lo = candle.open.min(candle.close);
+    let upper = (candle.high - body_hi).max(0.0);
+    let lower = (body_lo - candle.low).max(0.0);
+    let total = upper + lower;
+    (total > 0.0).then_some((lower - upper) / total)
+}
+
+fn candle_slice(tape: &VecDeque<UnderlyingPoint>, start: Instant, end: Instant) -> Option<Candle> {
+    let mut pts = tape.iter().filter(|p| p.ts >= start && p.ts <= end);
+    let first = pts.next()?;
+    let mut candle = Candle::new(first.px);
+    for pt in pts {
+        candle.push(pt.px);
+    }
+    Some(candle)
+}
+
+struct Candle {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+}
+
+impl Candle {
+    fn new(px: f64) -> Self {
+        Self {
+            open: px,
+            high: px,
+            low: px,
+            close: px,
+        }
+    }
+
+    fn push(&mut self, px: f64) {
+        self.high = self.high.max(px);
+        self.low = self.low.min(px);
+        self.close = px;
     }
 }
 
@@ -252,6 +356,25 @@ pub fn push_history(history: &mut VecDeque<(Instant, f64)>, ts: Instant, value: 
     while history.len() > 120 {
         history.pop_front();
     }
+}
+
+pub fn history_velocity(
+    history: &VecDeque<(Instant, f64)>,
+    now: Instant,
+    horizon: Duration,
+) -> f64 {
+    let Some((_, last)) = history.back() else {
+        return 0.0;
+    };
+    let Some((ts, base)) = history
+        .iter()
+        .rev()
+        .find(|(ts, _)| now.duration_since(*ts) >= horizon)
+    else {
+        return 0.0;
+    };
+    let dt = now.duration_since(*ts).as_secs_f64().max(0.001);
+    (last - base) / dt
 }
 
 pub fn to_series(history: &VecDeque<(Instant, f64)>) -> Vec<(f64, f64)> {

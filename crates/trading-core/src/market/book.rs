@@ -3,8 +3,8 @@ use super::types::{L2Level, OrderBook};
 use std::time::Instant;
 
 pub fn apply_snapshot(book: &mut OrderBook, bids: Vec<L2Level>, asks: Vec<L2Level>, ts: Instant) {
-    book.bids = bids;
-    book.asks = asks;
+    book.bids = norm_bids(bids);
+    book.asks = norm_asks(asks);
     book.last_update = ts;
 }
 
@@ -114,5 +114,63 @@ fn signed_ratio(bid: f64, ask: f64) -> f64 {
         0.0
     } else {
         ((bid - ask) / total).clamp(-1.0, 1.0)
+    }
+}
+
+fn norm_bids(mut levels: Vec<L2Level>) -> Vec<L2Level> {
+    levels.retain(|l| l.size > 0.into());
+    levels.sort_by(|a, b| b.price.cmp(&a.price));
+    levels
+}
+
+fn norm_asks(mut levels: Vec<L2Level>) -> Vec<L2Level> {
+    levels.retain(|l| l.size > 0.into());
+    levels.sort_by(|a, b| a.price.cmp(&b.price));
+    levels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn snapshot_normalizes_book_sides() {
+        let mut book = OrderBook::default();
+        let bids = vec![
+            L2Level {
+                price: dec!(0.94),
+                size: dec!(2),
+            },
+            L2Level {
+                price: dec!(0.96),
+                size: dec!(1),
+            },
+            L2Level {
+                price: dec!(0.95),
+                size: dec!(0),
+            },
+        ];
+        let asks = vec![
+            L2Level {
+                price: dec!(0.99),
+                size: dec!(4),
+            },
+            L2Level {
+                price: dec!(0.97),
+                size: dec!(3),
+            },
+            L2Level {
+                price: dec!(0.98),
+                size: dec!(0),
+            },
+        ];
+
+        apply_snapshot(&mut book, bids, asks, Instant::now());
+
+        assert_eq!(best_bid(&book), 0.96);
+        assert_eq!(best_ask(&book), 0.97);
+        assert_eq!(book.bids.len(), 2);
+        assert_eq!(book.asks.len(), 2);
     }
 }
